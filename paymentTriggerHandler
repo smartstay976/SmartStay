@@ -1,0 +1,80 @@
+/**
+ * Class Name      : PaymentTriggerHandler
+ * Created On      : 20-Nov-2025
+ * Created By      : Lokesh
+ * Description     : Business logic for Payment__c trigger.
+ *
+ * Responsibilities:
+ *      - Evaluate Payment_Status__c.
+ *      - Identify newly PAID transactions.
+ *      - Extend Tenant Check-Out Date by 30 days per payment.
+ */
+
+public class PaymentTriggerHandler {
+
+    public static void processPayments(List<Payment__c> newList, Map<Id, Payment__c> oldMap) {
+
+        Set<Id> tenantIds = new Set<Id>();
+
+        for (Payment__c p : newList) {
+
+            // Skip if tenant not linked
+            if (p.Tenant__c == null) continue;
+
+            Boolean isPaidNew = (p.Payment_Status__c == 'Paid');
+            Boolean wasPaidOld = false;
+
+            // If updated record, check old value
+            if (Trigger.isUpdate && oldMap != null) {
+                Payment__c oldP = oldMap.get(p.Id);
+                wasPaidOld = (oldP.Payment_Status__c == 'Paid');
+            }
+
+            // Condition 1: Insert record as PAID
+            Boolean insertedPaid = (Trigger.isInsert && isPaidNew);
+
+            // Condition 2: Updated from Unpaid → Paid
+            Boolean becamePaid = (Trigger.isUpdate && !wasPaidOld && isPaidNew);
+
+            if (insertedPaid || becamePaid) {
+                tenantIds.add(p.Tenant__c);
+            }
+        }
+
+        if (tenantIds.isEmpty()) return;
+
+        // Load all related tenants
+        List<Contact> tenants = [
+            SELECT Id, Check_In_Date__c, Check_Out_Date__c
+            FROM Contact
+            WHERE Id IN :tenantIds
+        ];
+
+        List<Contact> updates = new List<Contact>();
+
+        for (Contact t : tenants) {
+
+            if (t.Check_In_Date__c == null) continue;
+
+            Date newCheckout;
+
+            // If no previous checkout date
+            if (t.Check_Out_Date__c == null) {
+                newCheckout = t.Check_In_Date__c.addDays(30);
+            }
+            else {
+                // Extend by 30 days
+                newCheckout = t.Check_Out_Date__c.addDays(30);
+            }
+
+            updates.add(new Contact(
+                Id = t.Id,
+                Check_Out_Date__c = newCheckout
+            ));
+        }
+
+        if (!updates.isEmpty()) {
+            update updates;
+        }
+    }
+}
