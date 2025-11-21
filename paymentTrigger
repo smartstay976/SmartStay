@@ -1,0 +1,17 @@
+/**
+ * Trigger Name    : PaymentTrigger
+ * Created On      : 20-Nov-2025
+ * Created By      : Lokesh
+ * Description     : Handles post-insert and post-update logic for Payment__c.
+ * Responsibilities:
+ *      - Detect new PAID payments.
+ *      - Detect status change from Unpaid → Paid.
+ *      - Trigger Check-Out date extension in Tenant.
+ */
+
+trigger PaymentTrigger on Payment__c (after insert, after update) {
+
+    if (Trigger.isAfter) {
+        PaymentTriggerHandler.processPayments(Trigger.new, Trigger.oldMap);
+    }
+}
