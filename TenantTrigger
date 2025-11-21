@@ -1,0 +1,348 @@
+trigger TenantTrigger on Contact (before insert, before update, after insert, after update) {
+    
+    // Mobile = +91 + Phone (Lead → Tenant Conversion)
+    if (Trigger.isBefore && Trigger.isInsert) {
+        TenantTriggerHandler.formatMobileNumbers(Trigger.new);
+    }
+    
+    // Overbook protection
+    if (Trigger.isBefore && (Trigger.isInsert || Trigger.isUpdate)) {
+        TenantTriggerHandler.preventOverBooking(
+            Trigger.new,
+            Trigger.isUpdate ? Trigger.oldMap : null
+        );
+    }
+    
+    // AFTER UPDATE LOGIC
+    if (Trigger.isAfter && Trigger.isUpdate) {
+        
+        TenantTriggerRemainderHandler.processRemainingDays(
+            Trigger.new,
+            Trigger.oldMap
+        );
+        
+        TenantTriggerHandler.updateRoomOccupancy(
+            Trigger.new
+        );
+        
+        TenantTriggerHandler.processCheckout(
+            Trigger.new,
+            Trigger.oldMap
+        );
+        
+    }
+}
+
+
+
+/**
+ * Class Name      : TenantTriggerHandlerTest
+ * Created On      : 18-Nov-2025
+ * Created By      : Lokesh 
+ * Description     : Unit tests for TenantTriggerHandler and related trigger.
+ */
+
+@IsTest
+public class TenantTriggerHandlerTest {
+
+    // Create PG
+    private static PG__c createPG() {
+        PG__c pg = new PG__c(
+            Name = 'Test PG',
+            Address__c = 'Test Address',
+            Contact_Phone__c = '1234567890',
+            Key_Amenities__c = 'Wi-Fi'
+        );
+        insert pg;
+        return pg;
+    }
+
+    // Create Room
+    private static Room__c createRoom(String category, Boolean isFull) {
+        PG__c pg = createPG();
+        Room__c room = new Room__c(
+            PG_Name__c = pg.Id,
+            Rent__c = 60000,
+            Room_Type__c = 'AC',
+            Room_Category__c = category,
+            Room_Status__c = 'Active',
+            Is_Fully_Occupied__c = isFull
+        );
+        insert room;
+        return room;
+    }
+
+    // Create Tenant
+    private static Contact createTenant(Room__c room, Boolean active) {
+        Contact c = new Contact(
+            LastName = 'Test Tenant',
+            Active__c = active,
+            PG_Name__c = room.PG_Name__c,
+            Room__c = room.Id
+        );
+        insert c;
+        return c;
+    }
+
+    @IsTest
+    static void testPreventOverBooking() {
+        Room__c room = createRoom('1 Sharing', false);
+        Contact t1 = createTenant(room, true);
+
+        Contact t2 = new Contact(
+            LastName = 'Second Tenant',
+            Active__c = true,
+            PG_Name__c = room.PG_Name__c,
+            Room__c = room.Id
+        );
+
+        Test.startTest();
+        try {
+            insert t2;
+            System.assert(false, 'Should block due to overbooking.');
+        } catch (Exception e) {
+            System.assert(
+                e.getMessage().contains('capacity') ||
+                e.getMessage().contains('occupied')
+            );
+        }
+        Test.stopTest();
+    }
+
+    @IsTest
+    static void testUpdateRoomOccupancy() {
+        Room__c room = createRoom('2 Sharing', false);
+        Contact t1 = createTenant(room, true);
+        Contact t2 = createTenant(room, true);
+
+        Test.startTest();
+        update t1;
+        Test.stopTest();
+
+        Room__c updatedRoom = [
+            SELECT Is_Fully_Occupied__c FROM Room__c WHERE Id = :room.Id
+        ];
+
+        System.assertEquals(true, updatedRoom.Is_Fully_Occupied__c);
+    }
+
+    @IsTest
+    static void testCheckoutProcess() {
+        Room__c room = createRoom('3 Sharing', false);
+        Contact tenant = createTenant(room, true);
+
+        tenant.Active__c = false;
+
+        Test.startTest();
+        update tenant;
+        Test.stopTest();
+
+        Contact updatedTenant = [
+            SELECT Active__c, Room__c FROM Contact WHERE Id = :tenant.Id
+        ];
+
+        System.assertEquals(false, updatedTenant.Active__c);
+        System.assertEquals(null, updatedTenant.Room__c);
+    }
+
+    @IsTest
+    static void testFullyOccupiedBlock() {
+        Room__c room = createRoom('1 Sharing', true);
+
+        Contact t = new Contact(
+            LastName = 'Blocked Tenant',
+            Active__c = true,
+            PG_Name__c = room.PG_Name__c,
+            Room__c = room.Id
+        );
+
+        Test.startTest();
+        try {
+            insert t;
+            System.assert(false, 'Should block due to full room.');
+        } catch (Exception e) {
+            System.assert(e.getMessage().contains('fully occupied'));
+        }
+        Test.stopTest();
+    }
+
+    @IsTest
+    static void testFormatMobileNumbers() {
+        Contact tenant = new Contact(
+            LastName = 'Mobile Test',
+            Phone = '6304122265',
+            MobilePhone = null
+        );
+
+        Test.startTest();
+        insert tenant;
+        Test.stopTest();
+
+        Contact updatedTenant = [
+            SELECT Phone, MobilePhone FROM Contact WHERE Id = :tenant.Id
+        ];
+
+        System.assertEquals('6304122265', updatedTenant.Phone);
+        System.assertEquals('+916304122265', updatedTenant.MobilePhone);
+    }
+}
+/**
+ * Class Name      : TenantTriggerHandler
+ * Created On      : 18-Nov-2025
+ * Created By      : Lokesh 
+ * Description     : Handles all business logic related to Tenant object.
+ *
+ * Responsibilities:
+ *   - Prevent room overbooking.
+ *   - Update room Is_Fully_Occupied__c status.
+ *   - Auto-format MobilePhone as +91<Phone> during insert.
+ *   - Remove room assignment when Active__c becomes FALSE.
+ */
+
+public class TenantTriggerHandler {
+
+    // Extract numeric capacity from text like "3 Sharing"
+    public static Integer extractCapacity(String category) {
+        if (String.isBlank(category)) return 0;
+        String numberPart = category.split(' ')[0];
+        return Integer.valueOf(numberPart);
+    }
+
+    // Auto-format mobile number during insert: Mobile = +91 + Phone
+    public static void formatMobileNumbers(List<Contact> newList) {
+        for (Contact c : newList) {
+
+            // Only populate mobile if empty and phone exists
+            if (String.isBlank(c.MobilePhone) && !String.isBlank(c.Phone)) {
+
+                // Remove non-digit characters
+                String mobile = c.Phone.replaceAll('[^0-9]', '');
+
+                // Add country code if missing
+                if (!mobile.startsWith('91')) {
+                    mobile = '91' + mobile;
+                }
+
+                c.MobilePhone = '+' + mobile;
+            }
+        }
+    }
+
+    // Prevent assigning more tenants than room capacity
+    public static void preventOverBooking(List<Contact> newList, Map<Id, Contact> oldMap) {
+
+        Set<Id> roomIds = new Set<Id>();
+
+        // Collect room Ids
+        for (Contact t : newList) {
+            if (t.Room__c != null) {
+                roomIds.add(t.Room__c);
+            }
+        }
+
+        if (roomIds.isEmpty()) return;
+
+        // Fetch room info and existing tenants
+        Map<Id, Room__c> roomMap = new Map<Id, Room__c>(
+            [
+                SELECT Id, Room_Category__c, Is_Fully_Occupied__c,
+                       (SELECT Id FROM Tenants__r)
+                FROM Room__c
+                WHERE Id IN :roomIds
+            ]
+        );
+
+        for (Contact t : newList) {
+
+            if (t.Room__c == null) continue;
+
+            Room__c rm = roomMap.get(t.Room__c);
+
+            Integer existingTenants = rm.Tenants__r.size();
+            Integer capacity = extractCapacity(rm.Room_Category__c);
+
+            Boolean isNewAssignment =
+                (oldMap == null || oldMap.get(t.Id).Room__c != t.Room__c);
+
+            if (isNewAssignment) {
+                existingTenants++;
+            }
+
+            // If manually marked full, block assignment
+            if (rm.Is_Fully_Occupied__c == true) {
+                t.addError('This room is fully occupied.');
+            }
+
+            // If over capacity, block assignment
+            if (existingTenants > capacity) {
+                t.addError('Room capacity reached. Max capacity: ' + capacity);
+            }
+        }
+    }
+
+    // Update room Is_Fully_Occupied__c after insert/update
+    public static void updateRoomOccupancy(List<Contact> tenantList) {
+
+        Set<Id> roomIds = new Set<Id>();
+        for (Contact t : tenantList) {
+            if (t.Room__c != null) {
+                roomIds.add(t.Room__c);
+            }
+        }
+
+        if (roomIds.isEmpty()) return;
+
+        List<Room__c> roomsToUpdate = new List<Room__c>();
+
+        List<Room__c> rooms = [
+            SELECT Id, Room_Category__c, Is_Fully_Occupied__c,
+                   (SELECT Id FROM Tenants__r)
+            FROM Room__c
+            WHERE Id IN :roomIds
+        ];
+
+        for (Room__c rm : rooms) {
+
+            Integer capacity = extractCapacity(rm.Room_Category__c);
+            Integer tenantCount = rm.Tenants__r.size();
+
+            Boolean shouldBeFull = (tenantCount >= capacity);
+
+            // Update only if status changed
+            if (rm.Is_Fully_Occupied__c != shouldBeFull) {
+                rm.Is_Fully_Occupied__c = shouldBeFull;
+                roomsToUpdate.add(rm);
+            }
+        }
+
+        if (!roomsToUpdate.isEmpty()) {
+            update roomsToUpdate;
+        }
+    }
+
+    // When Active__c changes TRUE → FALSE, remove tenant from room
+    public static void processCheckout(List<Contact> newList, Map<Id, Contact> oldMap) {
+
+        List<Contact> tenantsToUpdate = new List<Contact>();
+
+        for (Contact newT : newList) {
+
+            Contact oldT = oldMap.get(newT.Id);
+
+            if (oldT.Active__c == true && newT.Active__c == false) {
+
+                Contact tUpdate = new Contact(
+                    Id = newT.Id,
+                    Room__c = null
+                );
+
+                tenantsToUpdate.add(tUpdate);
+            }
+        }
+
+        if (!tenantsToUpdate.isEmpty()) {
+            update tenantsToUpdate;
+        }
+    }
+}
+
