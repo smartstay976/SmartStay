@@ -1,0 +1,145 @@
+/**
+ * Class Name      : PaymentTriggerHandlerTest
+ * Created On      : 20-Nov-2025
+ * Created By      : Lokesh
+ * Description     : Unit tests for PaymentTriggerHandler and PaymentTrigger.
+ *
+ * Covers:
+ *   1. Insert Paid → Extend 30 days
+ *   2. Update Pending → Paid → Extend 30 days
+ *   3. Multiple Paid payments → Extend correctly
+ *   4. Payment without tenant → Should not throw error
+ */
+
+@IsTest
+public class PaymentTriggerHandlerTest {
+
+    // Create PG record
+    private static PG__c createPG() {
+        PG__c pg = new PG__c(
+            Name = 'Test PG',
+            Address__c = 'Test Address',
+            Contact_Phone__c = '9876543210',
+            Key_Amenities__c = 'Wi-Fi'
+        );
+        insert pg;
+        return pg;
+    }
+
+    // Create Tenant record
+    private static Contact createTenant(Date checkIn, Date checkout) {
+        Contact t = new Contact(
+            LastName = 'Test Tenant',
+            Check_In_Date__c = checkIn,
+            Check_Out_Date__c = checkout
+        );
+        insert t;
+        return t;
+    }
+
+    // Create Payment record with required fields
+    private static Payment__c createPayment(Id tenantId, Id pgId, String status) {
+        return new Payment__c(
+            Tenant__c = tenantId,
+            PG__c = pgId,
+            Amount__c = 5000,
+            Payment_Status__c = status
+        );
+    }
+
+    // 1. Insert Paid payment → Check-Out = Check-In + 30
+    @IsTest
+    static void testInsertPaidPayment() {
+
+        PG__c pg = createPG();
+        Contact tenant = createTenant(Date.today(), null);
+
+        Payment__c p = createPayment(tenant.Id, pg.Id, 'Paid');
+
+        Test.startTest();
+        insert p;
+        Test.stopTest();
+
+        Contact updatedTenant = [
+            SELECT Check_Out_Date__c FROM Contact WHERE Id = :tenant.Id
+        ];
+
+        System.assertEquals(
+            tenant.Check_In_Date__c.addDays(30),
+            updatedTenant.Check_Out_Date__c,
+            'Check-Out date should be Check-In + 30 days'
+        );
+    }
+
+    // 2. Update Pending → Paid should extend by 30 days
+    @IsTest
+    static void testUpdateToPaid() {
+
+        PG__c pg = createPG();
+        Contact tenant = createTenant(Date.today(), null);
+
+        Payment__c p = createPayment(tenant.Id, pg.Id, 'Pending'); // valid picklist
+
+        insert p;
+
+        // Now change to Paid
+        p.Payment_Status__c = 'Paid';
+
+        Test.startTest();
+        update p;
+        Test.stopTest();
+
+        Contact updatedTenant = [
+            SELECT Check_Out_Date__c FROM Contact WHERE Id = :tenant.Id
+        ];
+
+        System.assertEquals(
+            tenant.Check_In_Date__c.addDays(30),
+            updatedTenant.Check_Out_Date__c,
+            'Check-Out must update after becoming Paid'
+        );
+    }
+
+    // 3. Multiple payments extend 30 days each
+    @IsTest
+    static void testMultiplePayments() {
+
+        PG__c pg = createPG();
+        Contact tenant = createTenant(Date.today(), null);
+
+        Payment__c p1 = createPayment(tenant.Id, pg.Id, 'Paid');
+        insert p1;
+
+        Payment__c p2 = createPayment(tenant.Id, pg.Id, 'Paid');
+        insert p2;
+
+        Contact updatedTenant = [
+            SELECT Check_Out_Date__c FROM Contact WHERE Id = :tenant.Id
+        ];
+
+        System.assertEquals(
+            tenant.Check_In_Date__c.addDays(60),
+            updatedTenant.Check_Out_Date__c,
+            'Two payments must add 60 days'
+        );
+    }
+
+    // 4. Payment without tenant must NOT throw error
+    @IsTest
+    static void testPaymentWithoutTenant() {
+
+        PG__c pg = createPG();
+
+        Payment__c p = new Payment__c(
+            PG__c = pg.Id,
+            Amount__c = 5000,
+            Payment_Status__c = 'Paid'
+        );
+
+        Test.startTest();
+        insert p;
+        Test.stopTest();
+
+        System.assert(true, 'Payment without tenant must not fail');
+    }
+}
